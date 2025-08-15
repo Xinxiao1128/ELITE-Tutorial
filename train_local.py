@@ -282,7 +282,7 @@ def parse_args():
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     
-    # 🔥 新增参数：选择哪一层的词嵌入
+    # 🔥 New parameter: Select which layer embedding to use
     parser.add_argument(
         "--layer_index",
         type=int,
@@ -291,7 +291,7 @@ def parse_args():
         help="Which layer embedding to use (0-4, where 0 is the deepest layer w0, 4 is the shallowest w4)",
     )
     
-    # 🔥 新增参数：是否使用所有层的组合
+    # 🔥 New parameter: Whether to use combination of all layers
     parser.add_argument(
         "--use_all_layers",
         action="store_true",
@@ -330,11 +330,11 @@ def unfreeze_params(params):
 @torch.no_grad()
 def validation(example, tokenizer, image_encoder, text_encoder, unet, mapper, mapper_local, vae, device, guidance_scale, seed=None, llambda=1, num_steps=100, layer_index=0, use_all_layers=False):
     """
-    修改后的validation函数，支持选择不同层的词嵌入
+    Modified validation function supporting different layer embedding selection
     
     Args:
-        layer_index: 选择哪一层的词嵌入 (0-4)
-        use_all_layers: 是否使用所有层的组合
+        layer_index: Which layer embedding to select (0-4)
+        use_all_layers: Whether to use combination of all layers
     """
     scheduler = LMSDiscreteScheduler(
         beta_start=0.00085,
@@ -373,14 +373,14 @@ def validation(example, tokenizer, image_encoder, text_encoder, unet, mapper, ma
     image_embeddings = [emb.detach() for emb in image_embeddings]
     inj_embedding = mapper(image_embeddings)
 
-    # 🔥 关键修改：根据参数选择不同的词嵌入层
+    # 🔥 Key modification: Select different embedding layers based on parameters
     if use_all_layers:
-        # 使用所有层的组合（原始行为）
-        print(f"使用所有层的组合")
-        pass  # inj_embedding保持原样，包含所有层
+        # Use combination of all layers (original behavior)
+        print(f"Using combination of all layers")
+        pass  # inj_embedding remains as is, containing all layers
     else:
-        # 选择特定层的词嵌入
-        print(f"使用第{layer_index}层的词嵌入 (w_{layer_index})")
+        # Select specific layer embedding
+        print(f"Using layer {layer_index} embedding (w_{layer_index})")
         inj_embedding = inj_embedding[:, layer_index:layer_index+1, :]
     
     encoder_hidden_states = text_encoder({'input_ids': example["input_ids"],
@@ -620,11 +620,11 @@ def main():
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     
-    # 🔥 新增日志：显示当前使用的层信息
+    # 🔥 New logging: Display current layer usage information
     if args.use_all_layers:
-        logger.info(f"  使用模式：所有层组合")
+        logger.info(f"  Usage mode: All layers combined")
     else:
-        logger.info(f"  使用模式：单层 w_{args.layer_index}")
+        logger.info(f"  Usage mode: Single layer w_{args.layer_index}")
     
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
@@ -663,12 +663,12 @@ def main():
                 image_embeddings = [emb.detach() for emb in image_embeddings]
                 inj_embedding = mapper(image_embeddings)
 
-                # 🔥 关键修改：训练时也需要根据参数选择不同的词嵌入层
+                # 🔥 Key modification: Training also needs to select different embedding layers based on parameters
                 if args.use_all_layers:
-                    # 使用所有层的组合（原始行为）
-                    pass  # inj_embedding保持原样
+                    # Use combination of all layers (original behavior)
+                    pass  # inj_embedding remains as is
                 else:
-                    # 选择特定层的词嵌入
+                    # Select specific layer embedding
                     inj_embedding = inj_embedding[:, args.layer_index:args.layer_index+1, :]
 
                 # Get the text embedding for conditioning
@@ -718,7 +718,7 @@ def main():
                 global_step += 1
                 if global_step % args.save_steps == 0:
                     save_progress(mapper_local, accelerator, args, global_step)
-                    # 🔥 修改validation调用，传递层级参数
+                    # 🔥 Modified validation call, passing layer parameters
                     syn_images = validation(batch, tokenizer, image_encoder, text_encoder, unet, mapper, mapper_local, vae, batch["pixel_values_clip"].device, 5, layer_index=args.layer_index, use_all_layers=args.use_all_layers)
                     input_images = [th2image(img) for img in batch["pixel_values"]]
                     clip_images = [th2image(img).resize((512, 512)) for img in batch["pixel_values_clip"]]
@@ -731,7 +731,7 @@ def main():
                         img_list.append(np.concatenate((np.array(syn), np.array(input_img), np.array(input_mask), np.array(clip_image), np.array(obj_image), np.array(obj_mask)), axis=1))
                     img_list = np.concatenate(img_list, axis=0)
                     
-                    # 🔥 修改保存文件名，包含层级信息
+                    # 🔥 Modified save filename to include layer information
                     if args.use_all_layers:
                         filename = f"{str(global_step).zfill(5)}_all_layers.jpg"
                     else:
