@@ -1,301 +1,251 @@
-#!/usr/bin/env python3
-"""
-修改后的inference_local.py
-支持选择不同层的词嵌入进行推理
-"""
-
-import argparse
 import os
+from typing import Optional, Tuple
+
+import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
-import numpy as np
-from tqdm.auto import tqdm
-
 from diffusers import AutoencoderKL, LMSDiscreteScheduler, UNet2DConditionModel
+from PIL import Image
+from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModel
+from train_local import Mapper, th2image, MapperLocal
+from train_local import inj_forward_text, inj_forward_crossattention, validation
+import torch.nn as nn
+from datasets import CustomDatasetWithBG
 
-# 假设这些模块存在
-from train_global import inj_forward_text, th2image, Mapper
-from train_local import MapperLocal, inj_forward_crossattention
-from datasets import OpenImagesDatasetWithMask
+def _pil_from_latents(vae, latents):
+    _latents = 1 / 0.18215 * latents.clone()
+    image = vae.decode(_latents).sample
+
+    image = (image / 2 + 0.5).clamp(0, 1)
+    image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
+    images = (image * 255).round().astype("uint8")
+    ret_pil_images = [Image.fromarray(image) for image in images]
+
+    return ret_pil_images
 
 
-@torch.no_grad()
-def validation_with_layer_selection(example, tokenizer, image_encoder, text_encoder, unet, mapper, mapper_local, vae, device, guidance_scale, seed=None, llambda=1, num_steps=100, layer_index=0, use_all_layers=False):
-    """
-    支持层级选择的validation函数
-    """
-    scheduler = LMSDiscreteScheduler(
+def pww_load_tools(
+    device: str = "cuda:0",
+    scheduler_type=LMSDiscreteScheduler,
+    mapper_model_path: Optional[str] = None,
+    mapper_local_model_path: Optional[str] = None,
+    diffusion_model_path: Optional[str] = None,
+    model_token: Optional[str] = None,
+) -> Tuple[
+    UNet2DConditionModel,
+    CLIPTextModel,
+    CLIPTokenizer,
+    AutoencoderKL,
+    CLIPVisionModel,
+    Mapper,
+    MapperLocal,
+    LMSDiscreteScheduler,
+]:
+
+    # 'CompVis/stable-diffusion-v1-4'
+    # local_path_only = diffusion_model_path is not None
+    local_path_only = False
+    vae = AutoencoderKL.from_pretrained(
+        diffusion_model_path,
+        subfolder="vae",
+        use_auth_token=model_token,
+        torch_dtype=torch.float16,
+        local_files_only=local_path_only,
+    )
+
+    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float16,)
+    text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float16,)
+    image_encoder = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float16,)
+
+
+    # Load models and create wrapper for stable diffusion
+    for _module in text_encoder.modules():
+        if _module.__class__.__name__ == "CLIPTextTransformer":
+            _module.__class__.__call__ = inj_forward_text
+
+    unet = UNet2DConditionModel.from_pretrained(
+        diffusion_model_path,
+        subfolder="unet",
+        use_auth_token=model_token,
+        torch_dtype=torch.float16,
+        local_files_only=local_path_only,
+    )
+
+    mapper = Mapper(input_dim=1024, output_dim=768)
+
+    mapper_local = MapperLocal(input_dim=1024, output_dim=768)
+
+    for _name, _module in unet.named_modules():
+        if _module.__class__.__name__ == "CrossAttention":
+            if 'attn1' in _name: continue
+            _module.__class__.__call__ = inj_forward_crossattention
+
+            shape = _module.to_k.weight.shape
+            to_k_global = nn.Linear(shape[1], shape[0], bias=False)
+            mapper.add_module(f'{_name.replace(".", "_")}_to_k', to_k_global)
+
+            shape = _module.to_v.weight.shape
+            to_v_global = nn.Linear(shape[1], shape[0], bias=False)
+            mapper.add_module(f'{_name.replace(".", "_")}_to_v', to_v_global)
+
+            to_v_local = nn.Linear(shape[1], shape[0], bias=False)
+            mapper_local.add_module(f'{_name.replace(".", "_")}_to_v', to_v_local)
+
+            to_k_local = nn.Linear(shape[1], shape[0], bias=False)
+            mapper_local.add_module(f'{_name.replace(".", "_")}_to_k', to_k_local)
+
+    mapper.load_state_dict(torch.load(mapper_model_path, map_location='cpu'))
+    mapper.half()
+
+    mapper_local.load_state_dict(torch.load(mapper_local_model_path, map_location='cpu'))
+    mapper_local.half()
+
+    for _name, _module in unet.named_modules():
+        if 'attn1' in _name: continue
+        if _module.__class__.__name__ == "CrossAttention":
+            _module.add_module('to_k_global', mapper.__getattr__(f'{_name.replace(".", "_")}_to_k'))
+            _module.add_module('to_v_global', mapper.__getattr__(f'{_name.replace(".", "_")}_to_v'))
+            _module.add_module('to_v_local', getattr(mapper_local, f'{_name.replace(".", "_")}_to_v'))
+            _module.add_module('to_k_local', getattr(mapper_local, f'{_name.replace(".", "_")}_to_k'))
+
+    vae.to(device), unet.to(device), text_encoder.to(device), image_encoder.to(device), mapper.to(device), mapper_local.to(device)
+
+    scheduler = scheduler_type(
         beta_start=0.00085,
         beta_end=0.012,
         beta_schedule="scaled_linear",
         num_train_timesteps=1000,
     )
+    vae.eval()
+    unet.eval()
+    image_encoder.eval()
+    text_encoder.eval()
+    mapper.eval()
+    mapper_local.eval()
+    return vae, unet, text_encoder, tokenizer, image_encoder, mapper, mapper_local, scheduler
 
-    uncond_input = tokenizer(
-        [''] * example["pixel_values"].shape[0],
-        padding="max_length",
-        max_length=tokenizer.model_max_length,
-        return_tensors="pt",
-    )
-    uncond_embeddings = text_encoder({'input_ids':uncond_input.input_ids.to(device)})[0]
-
-    if seed is None:
-        latents = torch.randn(
-            (example["pixel_values"].shape[0], unet.in_channels, 64, 64)
-        )
-    else:
-        generator = torch.manual_seed(seed)
-        latents = torch.randn(
-            (example["pixel_values"].shape[0], unet.in_channels, 64, 64), generator=generator,
-        )
-
-    latents = latents.to(example["pixel_values_clip"])
-    scheduler.set_timesteps(num_steps)
-    latents = latents * scheduler.init_noise_sigma
-
-    placeholder_idx = example["index"]
-
-    image = F.interpolate(example["pixel_values_clip"], (224, 224), mode='bilinear')
-    image_features = image_encoder(image, output_hidden_states=True)
-    image_embeddings = [image_features[0], image_features[2][4], image_features[2][8], image_features[2][12], image_features[2][16]]
-    image_embeddings = [emb.detach() for emb in image_embeddings]
-    inj_embedding = mapper(image_embeddings)
-
-    # 🔥 关键修改：根据参数选择不同的词嵌入层
-    if use_all_layers:
-        print(f"🔥 使用所有层的组合进行推理")
-        # inj_embedding保持原样，包含所有层
-    else:
-        print(f"🔥 使用第{layer_index}层的词嵌入 (w_{layer_index}) 进行推理")
-        inj_embedding = inj_embedding[:, layer_index:layer_index+1, :]
-
-    encoder_hidden_states = text_encoder({'input_ids': example["input_ids"],
-                                          "inj_embedding": inj_embedding,
-                                          "inj_index": placeholder_idx})[0]
-
-    image_obj = F.interpolate(example["pixel_values_obj"], (224, 224), mode='bilinear')
-    image_features_obj = image_encoder(image_obj, output_hidden_states=True)
-    image_embeddings_obj = [image_features_obj[0], image_features_obj[2][4], image_features_obj[2][8],
-                            image_features_obj[2][12], image_features_obj[2][16]]
-    image_embeddings_obj = [emb.detach() for emb in image_embeddings_obj]
-
-    inj_embedding_local = mapper_local(image_embeddings_obj)
-    mask = F.interpolate(example["pixel_values_seg"], (16, 16), mode='nearest')
-    mask = mask[:, 0].reshape(mask.shape[0], -1, 1)
-    inj_embedding_local = inj_embedding_local * mask
-
-    for t in tqdm(scheduler.timesteps):
-        latent_model_input = scheduler.scale_model_input(latents, t)
-        noise_pred_text = unet(
-            latent_model_input,
-            t,
-            encoder_hidden_states={
-                "CONTEXT_TENSOR": encoder_hidden_states,
-                "LOCAL": inj_embedding_local,
-                "LOCAL_INDEX": placeholder_idx.detach(),
-                "LAMBDA": llambda
-            }
-        ).sample
-        
-        latent_model_input = scheduler.scale_model_input(latents, t)
-        noise_pred_uncond = unet(
-            latent_model_input,
-            t,
-            encoder_hidden_states={
-                "CONTEXT_TENSOR": uncond_embeddings,
-            }
-        ).sample
-        
-        noise_pred = noise_pred_uncond + guidance_scale * (
-                noise_pred_text - noise_pred_uncond
-        )
-
-        # compute the previous noisy sample x_t -> x_t-1
-        latents = scheduler.step(noise_pred, t, latents).prev_sample
-
-    _latents = 1 / 0.18215 * latents.clone()
-    images = vae.decode(_latents).sample
-    ret_pil_images = [th2image(image) for image in images]
-
-    return ret_pil_images
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="ELITE Local Inference with Layer Selection")
-    
-    parser.add_argument(
-        "--pretrained_model_name_or_path",
-        type=str,
-        required=True,
-        help="Path to pretrained model or model identifier from huggingface.co/models.",
-    )
-    parser.add_argument(
-        "--test_data_dir",
-        type=str,
-        required=True,
-        help="A folder containing the test data."
-    )
-    parser.add_argument(
-        "--template",
-        type=str,
-        default="a photo of S",
-        help="Template for text prompt"
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="./outputs/layer_analysis",
-        help="Directory to save outputs"
-    )
-    parser.add_argument(
-        "--suffix",
-        type=str,
-        default="test",
-        help="Suffix for output files"
-    )
-    parser.add_argument(
-        "--llambda",
-        type=float,
-        default=0.8,
-        help="Lambda value for local attention"
-    )
+
+    import argparse
+    parser = argparse.ArgumentParser(description="Simple example of a training script.")
+
     parser.add_argument(
         "--global_mapper_path",
         type=str,
         required=True,
-        help="Path to global mapper checkpoint"
+        help="Path to pretrained global mapping network.",
     )
+
     parser.add_argument(
         "--local_mapper_path",
         type=str,
         required=True,
-        help="Path to local mapper checkpoint"
+        help="Path to pretrained local mapping network.",
     )
+
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default='outputs',
+        help="The output directory where the model predictions will be written.",
+    )
+
+    parser.add_argument(
+        "--placeholder_token",
+        type=str,
+        default="S",
+        help="A token to use as a placeholder for the concept.",
+    )
+
+    parser.add_argument(
+        "--template",
+        type=str,
+        default="a photo of a {}",
+        help="Text template for customized genetation.",
+    )
+
+    parser.add_argument(
+        "--test_data_dir", type=str, default=None, required=True, help="A folder containing the testing data."
+    )
+
+    parser.add_argument(
+        "--pretrained_model_name_or_path",
+        type=str,
+        default=None,
+        required=True,
+        help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+
+    parser.add_argument(
+        "--suffix",
+        type=str,
+        default="object",
+        help="Suffix of save directory.",
+    )
+
+    parser.add_argument(
+        "--selected_data",
+        type=int,
+        default=-1,
+        help="Data index. -1 for all.",
+    )
+
+    parser.add_argument(
+        "--llambda",
+        type=str,
+        default="0.8",
+        help="Lambda for fuse the global and local feature.",
+    )
+
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
-        help="Random seed"
+        default=None,
+        help="A seed for testing.",
     )
-    
-    # 🔥 新增参数：选择哪一层的词嵌入
-    parser.add_argument(
-        "--layer_index",
-        type=int,
-        default=0,
-        choices=[0, 1, 2, 3, 4],
-        help="Which layer embedding to use (0-4, where 0 is the deepest layer w0, 4 is the shallowest w4)",
-    )
-    
-    # 🔥 新增参数：是否使用所有层的组合
-    parser.add_argument(
-        "--use_all_layers",
-        action="store_true",
-        help="Use all layers combined instead of a single layer",
-    )
-    
-    return parser.parse_args()
 
-
-def main():
-    args = parse_args()
-    
-    # 创建输出目录
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    # 设置设备
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # 加载模型
-    print("加载模型...")
-    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
-    text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
-    image_encoder = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14")
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
-    unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
-    
-    # 设置forward方法
-    for _module in text_encoder.modules():
-        if _module.__class__.__name__ == "CLIPTextTransformer":
-            _module.__class__.__call__ = inj_forward_text
-    
-    # 加载mapper
-    mapper = Mapper(input_dim=1024, output_dim=768)
-    mapper_local = MapperLocal(input_dim=1024, output_dim=768)
-    
-    # 设置UNet的交叉注意力
-    for _name, _module in unet.named_modules():
-        if _module.__class__.__name__ == "CrossAttention":
-            if 'attn1' in _name: continue
-            _module.__class__.__call__ = inj_forward_crossattention
-    
-    # 加载预训练权重
-    print("加载预训练权重...")
-    mapper.load_state_dict(torch.load(args.global_mapper_path, map_location='cpu'))
-    mapper_local.load_state_dict(torch.load(args.local_mapper_path, map_location='cpu'))
-    
-    # 移动到设备
-    text_encoder.to(device)
-    image_encoder.to(device)
-    vae.to(device)
-    unet.to(device)
-    mapper.to(device)
-    mapper_local.to(device)
-    
-    # 设置为评估模式
-    text_encoder.eval()
-    image_encoder.eval()
-    vae.eval()
-    unet.eval()
-    mapper.eval()
-    mapper_local.eval()
-    
-    # 加载测试数据
-    print("加载测试数据...")
-    test_dataset = OpenImagesDatasetWithMask(
-        data_root=args.test_data_dir,
-        tokenizer=tokenizer,
-        size=512,
-        placeholder_token="S",
-        set="test"
-    )
-    
-    # 运行推理
-    print(f"开始推理...")
-    if args.use_all_layers:
-        print(f"使用模式：所有层组合")
-        layer_info = "all_layers"
-    else:
-        print(f"使用模式：单层 w_{args.layer_index}")
-        layer_info = f"w{args.layer_index}"
-    
-    for i, example in enumerate(test_dataset):
-        print(f"处理第 {i+1}/{len(test_dataset)} 个样本...")
-        
-        # 添加batch维度
-        for key in example:
-            if isinstance(example[key], torch.Tensor):
-                example[key] = example[key].unsqueeze(0).to(device)
-        
-        # 生成图像
-        generated_images = validation_with_layer_selection(
-            example, tokenizer, image_encoder, text_encoder, unet, 
-            mapper, mapper_local, vae, device, 
-            guidance_scale=7.5, seed=args.seed, llambda=args.llambda,
-            layer_index=args.layer_index, use_all_layers=args.use_all_layers
-        )
-        
-        # 保存结果
-        for j, img in enumerate(generated_images):
-            filename = f"{args.suffix}_{layer_info}_sample{i}_img{j}.png"
-            output_path = os.path.join(args.output_dir, filename)
-            img.save(output_path)
-            print(f"保存图像: {output_path}")
-    
-    print("推理完成！")
+    args = parser.parse_args()
+    return args
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+
+    save_dir = os.path.join(args.output_dir, f'{args.suffix}_l{args.llambda.replace(".", "p")}')
+    os.makedirs(save_dir, exist_ok=True)
+
+    vae, unet, text_encoder, tokenizer, image_encoder, mapper, mapper_local, scheduler = pww_load_tools(
+            "cuda:0",
+            LMSDiscreteScheduler,
+            diffusion_model_path=args.pretrained_model_name_or_path,
+            mapper_model_path=args.global_mapper_path,
+            mapper_local_model_path=args.local_mapper_path,
+        )
+
+    train_dataset = CustomDatasetWithBG(
+        data_root=args.test_data_dir,
+        tokenizer=tokenizer,
+        size=512,
+        placeholder_token=args.placeholder_token,
+        template=args.template,
+    )
+
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=False)
+    for step, batch in enumerate(train_dataloader):
+        if args.selected_data > -1 and step != args.selected_data:
+            continue
+        batch["pixel_values"] = batch["pixel_values"].to("cuda:0")
+        batch["pixel_values_clip"] = batch["pixel_values_clip"].to("cuda:0").half()
+        batch["pixel_values_obj"] = batch["pixel_values_obj"].to("cuda:0").half()
+        batch["pixel_values_seg"] = batch["pixel_values_seg"].to("cuda:0").half()
+        batch["input_ids"] = batch["input_ids"].to("cuda:0")
+        batch["index"] = batch["index"].to("cuda:0").long()
+        print(step, batch['text'])
+        syn_images = validation(batch, tokenizer, image_encoder, text_encoder, unet, mapper, mapper_local, vae,
+                                batch["pixel_values_clip"].device, 5,
+                                seed=args.seed, llambda=float(args.llambda))
+        concat = np.concatenate((np.array(syn_images[0]), th2image(batch["pixel_values"][0])), axis=1)
+        Image.fromarray(concat).save(os.path.join(save_dir, f'{str(step).zfill(5)}_{str(args.seed).zfill(5)}.jpg'))
