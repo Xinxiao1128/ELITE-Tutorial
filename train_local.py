@@ -281,6 +281,22 @@ def parse_args():
         ),
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+    
+    # 🔥 新增参数：选择哪一层的词嵌入
+    parser.add_argument(
+        "--layer_index",
+        type=int,
+        default=0,
+        choices=[0, 1, 2, 3, 4],
+        help="Which layer embedding to use (0-4, where 0 is the deepest layer w0, 4 is the shallowest w4)",
+    )
+    
+    # 🔥 新增参数：是否使用所有层的组合
+    parser.add_argument(
+        "--use_all_layers",
+        action="store_true",
+        help="Use all layers combined instead of a single layer",
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -312,7 +328,14 @@ def unfreeze_params(params):
 
 
 @torch.no_grad()
-def validation(example, tokenizer, image_encoder, text_encoder, unet, mapper, mapper_local, vae, device, guidance_scale, seed=None, llambda=1, num_steps=100):
+def validation(example, tokenizer, image_encoder, text_encoder, unet, mapper, mapper_local, vae, device, guidance_scale, seed=None, llambda=1, num_steps=100, layer_index=0, use_all_layers=False):
+    """
+    修改后的validation函数，支持选择不同层的词嵌入
+    
+    Args:
+        layer_index: 选择哪一层的词嵌入 (0-4)
+        use_all_layers: 是否使用所有层的组合
+    """
     scheduler = LMSDiscreteScheduler(
         beta_start=0.00085,
         beta_end=0.012,
@@ -350,7 +373,16 @@ def validation(example, tokenizer, image_encoder, text_encoder, unet, mapper, ma
     image_embeddings = [emb.detach() for emb in image_embeddings]
     inj_embedding = mapper(image_embeddings)
 
-    inj_embedding = inj_embedding[:, 0:1, :]
+    # 🔥 关键修改：根据参数选择不同的词嵌入层
+    if use_all_layers:
+        # 使用所有层的组合（原始行为）
+        print(f"使用所有层的组合")
+        pass  # inj_embedding保持原样，包含所有层
+    else:
+        # 选择特定层的词嵌入
+        print(f"使用第{layer_index}层的词嵌入 (w_{layer_index})")
+        inj_embedding = inj_embedding[:, layer_index:layer_index+1, :]
+    
     encoder_hidden_states = text_encoder({'input_ids': example["input_ids"],
                                           "inj_embedding": inj_embedding,
                                           "inj_index": placeholder_idx})[0]
@@ -587,6 +619,13 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    
+    # 🔥 新增日志：显示当前使用的层信息
+    if args.use_all_layers:
+        logger.info(f"  使用模式：所有层组合")
+    else:
+        logger.info(f"  使用模式：单层 w_{args.layer_index}")
+    
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
@@ -624,8 +663,13 @@ def main():
                 image_embeddings = [emb.detach() for emb in image_embeddings]
                 inj_embedding = mapper(image_embeddings)
 
-                # only use the first word
-                inj_embedding = inj_embedding[:, 0:1, :]
+                # 🔥 关键修改：训练时也需要根据参数选择不同的词嵌入层
+                if args.use_all_layers:
+                    # 使用所有层的组合（原始行为）
+                    pass  # inj_embedding保持原样
+                else:
+                    # 选择特定层的词嵌入
+                    inj_embedding = inj_embedding[:, args.layer_index:args.layer_index+1, :]
 
                 # Get the text embedding for conditioning
                 encoder_hidden_states = text_encoder({'input_ids': batch["input_ids"],
@@ -674,7 +718,8 @@ def main():
                 global_step += 1
                 if global_step % args.save_steps == 0:
                     save_progress(mapper_local, accelerator, args, global_step)
-                    syn_images = validation(batch, tokenizer, image_encoder, text_encoder, unet, mapper, mapper_local, vae, batch["pixel_values_clip"].device, 5)
+                    # 🔥 修改validation调用，传递层级参数
+                    syn_images = validation(batch, tokenizer, image_encoder, text_encoder, unet, mapper, mapper_local, vae, batch["pixel_values_clip"].device, 5, layer_index=args.layer_index, use_all_layers=args.use_all_layers)
                     input_images = [th2image(img) for img in batch["pixel_values"]]
                     clip_images = [th2image(img).resize((512, 512)) for img in batch["pixel_values_clip"]]
                     obj_images = [th2image(img).resize((512, 512)) for img in batch["pixel_values_obj"]]
@@ -685,7 +730,14 @@ def main():
                     for syn, input_img, input_mask, clip_image, obj_image, obj_mask in zip(syn_images, input_images, input_masks, clip_images, obj_images, obj_masks):
                         img_list.append(np.concatenate((np.array(syn), np.array(input_img), np.array(input_mask), np.array(clip_image), np.array(obj_image), np.array(obj_mask)), axis=1))
                     img_list = np.concatenate(img_list, axis=0)
-                    Image.fromarray(img_list).save(os.path.join(args.output_dir, f"{str(global_step).zfill(5)}.jpg"))
+                    
+                    # 🔥 修改保存文件名，包含层级信息
+                    if args.use_all_layers:
+                        filename = f"{str(global_step).zfill(5)}_all_layers.jpg"
+                    else:
+                        filename = f"{str(global_step).zfill(5)}_w{args.layer_index}.jpg"
+                    
+                    Image.fromarray(img_list).save(os.path.join(args.output_dir, filename))
 
             logs = {"loss_mle": loss_mle.detach().item(), "loss_reg": loss_reg.detach().item(),  "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
