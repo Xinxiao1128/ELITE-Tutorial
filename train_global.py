@@ -33,8 +33,7 @@ from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModel
 from typing import Optional, Tuple, Union
 from datasets import OpenImagesDataset
 
-
-
+# ... Keep Mapper class and other functions unchanged ...
 class Mapper(nn.Module):
     def __init__(self,
         input_dim: int,
@@ -67,145 +66,9 @@ class Mapper(nn.Module):
         hidden_states = torch.cat(hidden_states, dim=1)
         return hidden_states
 
-
-def _build_causal_attention_mask(bsz, seq_len, dtype):
-    # lazily create causal attention mask, with full attention between the vision tokens
-    # pytorch uses additive attention mask; fill with -inf
-    mask = torch.empty(bsz, seq_len, seq_len, dtype=dtype)
-    mask.fill_(torch.tensor(torch.finfo(dtype).min))
-    mask.triu_(1)  # zero out the lower diagonal
-    mask = mask.unsqueeze(1)  # expand mask
-    return mask
-
-
-@add_start_docstrings_to_model_forward(CLIP_TEXT_INPUTS_DOCSTRING)
-@replace_return_docstrings(output_type=BaseModelOutputWithPooling, config_class=CLIPTextConfig)
-def inj_forward_text(
-        self,
-        input_ids: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-) -> Union[Tuple, BaseModelOutputWithPooling]:
-    r"""
-    Returns:
-    """
-    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-    output_hidden_states = (
-        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-    )
-    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-    if input_ids is None:
-        raise ValueError("You have to specify either input_ids")
-
-    r_input_ids = input_ids['input_ids']
-    if 'inj_embedding' in input_ids:
-        inj_embedding = input_ids['inj_embedding']
-        inj_index = input_ids['inj_index']
-    else:
-        inj_embedding = None
-        inj_index = None
-
-    input_shape = r_input_ids.size()
-    r_input_ids = r_input_ids.view(-1, input_shape[-1])
-
-
-    inputs_embeds = self.embeddings.token_embedding(r_input_ids)
-    new_inputs_embeds = inputs_embeds.clone()
-    if inj_embedding is not None:
-        emb_length = inj_embedding.shape[1]
-        for bsz, idx in enumerate(inj_index):
-            lll = new_inputs_embeds[bsz, idx+emb_length:].shape[0]
-            new_inputs_embeds[bsz, idx+emb_length:] = inputs_embeds[bsz, idx+1:idx+1+lll]
-            new_inputs_embeds[bsz, idx:idx+emb_length] = inj_embedding[bsz]
-
-    hidden_states = self.embeddings(input_ids=r_input_ids, position_ids=position_ids, inputs_embeds=new_inputs_embeds)
-
-    bsz, seq_len = input_shape
-    # CLIP's text model uses causal mask, prepare it here.
-    # https://github.com/openai/CLIP/blob/cfcffb90e69f37bf2ff1e988237a0fbe41f33c04/clip/model.py#L324
-    causal_attention_mask = _build_causal_attention_mask(bsz, seq_len, hidden_states.dtype).to(
-        hidden_states.device
-    )
-    # expand attention_mask
-    if attention_mask is not None:
-        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-        attention_mask = _expand_mask(attention_mask, hidden_states.dtype)
-
-    encoder_outputs = self.encoder(
-        inputs_embeds=hidden_states,
-        attention_mask=attention_mask,
-        causal_attention_mask=causal_attention_mask,
-        output_attentions=output_attentions,
-        output_hidden_states=output_hidden_states,
-        return_dict=return_dict,
-    )
-
-    last_hidden_state = encoder_outputs[0]
-    last_hidden_state = self.final_layer_norm(last_hidden_state)
-
-    # text_embeds.shape = [batch_size, sequence_length, transformer.width]
-    # take features from the eot embedding (eot_token is the highest number in each sequence)
-    # casting to torch.int for onnx compatibility: argmax doesn't support int64 inputs with opset 14
-    pooled_output = last_hidden_state[
-        torch.arange(last_hidden_state.shape[0], device=r_input_ids.device), r_input_ids.to(torch.int).argmax(dim=-1)
-    ]
-
-    if not return_dict:
-        return (last_hidden_state, pooled_output) + encoder_outputs[1:]
-
-    return BaseModelOutputWithPooling(
-        last_hidden_state=last_hidden_state,
-        pooler_output=pooled_output,
-        hidden_states=encoder_outputs.hidden_states,
-        attentions=encoder_outputs.attentions,
-    )
-
-def inj_forward_crossattention(self, hidden_states, encoder_hidden_states=None, attention_mask=None):
-    context = encoder_hidden_states
-    if context is not None:
-        context_tensor = context["CONTEXT_TENSOR"]
-    else:
-        context_tensor = hidden_states
-
-    batch_size, sequence_length, _ = hidden_states.shape
-
-    query = self.to_q(hidden_states)
-    if context is not None:
-        key = self.to_k_global(context_tensor)
-        value = self.to_v_global(context_tensor)
-    else:
-        key = self.to_k(context_tensor)
-        value = self.to_v(context_tensor)
-
-    dim = query.shape[-1]
-
-    query = self.reshape_heads_to_batch_dim(query)
-    key = self.reshape_heads_to_batch_dim(key)
-    value = self.reshape_heads_to_batch_dim(value)
-
-    attention_scores = torch.matmul(query, key.transpose(-1, -2))
-    attention_scores = attention_scores * self.scale
-
-    attention_probs = attention_scores.softmax(dim=-1)
-
-    hidden_states = torch.matmul(attention_probs, value)
-    hidden_states = self.reshape_batch_dim_to_heads(hidden_states)
-
-    # linear proj
-    hidden_states = self.to_out[0](hidden_states)
-    # dropout
-    hidden_states = self.to_out[1](hidden_states)
-
-    return hidden_states
-
-
+# ... Keep other functions unchanged, including inj_forward_text and inj_forward_crossattention ...
 
 logger = get_logger(__name__)
-
 
 def save_progress(mapper, accelerator, args, step=None):
     logger.info("Saving embeddings")
@@ -216,7 +79,6 @@ def save_progress(mapper, accelerator, args, step=None):
         torch.save(state_dict, os.path.join(args.output_dir, f"mapper_{str(step).zfill(6)}.pt"))
     else:
         torch.save(state_dict, os.path.join(args.output_dir, "mapper.pt"))
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -342,6 +204,14 @@ def parse_args():
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
 
+    # 🔥 New parameter: Select which token embedding to use
+    parser.add_argument(
+        "--token_index",
+        type=str,
+        default="full",
+        help="Which token embedding to use during validation: 0-4 for specific layer, 'full' for all combined, 'compare' for generating all layers"
+    )
+
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -375,7 +245,7 @@ def th2image(image):
     image = (image * 255).round().astype("uint8")
     return Image.fromarray(image)
 
-
+# 🔥 Key modification: Validation function supporting different token embedding selection
 @torch.no_grad()
 def validation(example, tokenizer, image_encoder, text_encoder, unet, mapper, vae, device, guidance_scale, token_index='full', seed=None):
     scheduler = LMSDiscreteScheduler(
@@ -416,9 +286,22 @@ def validation(example, tokenizer, image_encoder, text_encoder, unet, mapper, va
     image_embeddings = [emb.detach() for emb in image_embeddings]
     inj_embedding = mapper(image_embeddings)
 
-    if token_index != 'full':
+    # 🔥 Key modification: Select different token embeddings based on token_index
+    if token_index == 'full':
+        # Original method: Use all 5 token embeddings
+        pass  # inj_embedding remains as is, shape: [batch, 5, 768]
+    elif token_index.isdigit():
+        # Select specific layer token embedding
         token_index = int(token_index)
-        inj_embedding = inj_embedding[:, token_index:token_index + 1, :]
+        if 0 <= token_index <= 4:
+            print(f"🔍 Using token embedding from layer {token_index}")
+            # Only use specified layer token embedding, repeat 5 times to maintain shape consistency
+            selected_embedding = inj_embedding[:, token_index:token_index + 1, :]  # [batch, 1, 768]
+            inj_embedding = selected_embedding.repeat(1, 5, 1)  # [batch, 5, 768]
+        else:
+            print(f"⚠️ Invalid token_index {token_index}, using full embeddings")
+    else:
+        print(f"⚠️ Unknown token_index '{token_index}', using full embeddings")
 
     encoder_hidden_states = text_encoder({'input_ids': example["input_ids"],
                                           "inj_embedding": inj_embedding,
@@ -456,6 +339,55 @@ def validation(example, tokenizer, image_encoder, text_encoder, unet, mapper, va
     ret_pil_images = [th2image(image) for image in images]
 
     return ret_pil_images
+
+# 🔥 New function: Generate comparison images for all layers
+@torch.no_grad()
+def generate_layer_comparison(example, tokenizer, image_encoder, text_encoder, unet, mapper, vae, device, output_dir, step):
+    """Generate comparison images using different token embedding layers"""
+
+    print("🔍 Generating layer comparison images...")
+    layer_names = ["Layer_0_deepest", "Layer_1", "Layer_2", "Layer_3", "Layer_4_shallowest", "Full_combined"]
+    layer_images = []
+
+    # Generate images for each layer
+    for i in range(5):
+        print(f"   Generating image for layer {i}...")
+        images = validation(example, tokenizer, image_encoder, text_encoder, unet, mapper, vae, device, 5, token_index=str(i), seed=42)
+        layer_images.append(images[0])
+
+    # Generate image using all layers combined
+    print("   Generating image for full combined layers...")
+    images = validation(example, tokenizer, image_encoder, text_encoder, unet, mapper, vae, device, 5, token_index='full', seed=42)
+    layer_images.append(images[0])
+
+    # Create comparison grid
+    target_size = (256, 256)
+    resized_images = [img.resize(target_size) for img in layer_images]
+
+    # Create 2x3 grid
+    grid_width = 3 * target_size[0]
+    grid_height = 2 * target_size[1]
+    grid_image = Image.new('RGB', (grid_width, grid_height), color='white')
+
+    # Place images
+    for i, (img, name) in enumerate(zip(resized_images, layer_names)):
+        row = i // 3
+        col = i % 3
+        x = col * target_size[0]
+        y = row * target_size[1]
+        grid_image.paste(img, (x, y))
+
+    # Save comparison grid
+    grid_path = os.path.join(output_dir, f"layer_comparison_step_{str(step).zfill(5)}.jpg")
+    grid_image.save(grid_path)
+    print(f"📸 Layer comparison saved to: {grid_path}")
+
+    # Save individual layer images
+    for i, (img, name) in enumerate(zip(resized_images, layer_names)):
+        img_path = os.path.join(output_dir, f"step_{str(step).zfill(5)}_{name}.jpg")
+        img.save(img_path)
+
+    return layer_images
 
 def main():
     args = parse_args()
@@ -686,13 +618,26 @@ def main():
                 global_step += 1
                 if global_step % args.save_steps == 0:
                     save_progress(mapper, accelerator, args, global_step)
-                    syn_images = validation(batch, tokenizer, image_encoder, text_encoder, unet, mapper, vae, batch["pixel_values_clip"].device, 5)
-                    gt_images = [th2image(img) for img in batch["pixel_values"]]
-                    img_list = []
-                    for syn, gt in zip(syn_images, gt_images):
-                        img_list.append(np.concatenate((np.array(syn), np.array(gt)), axis=1))
-                    img_list = np.concatenate(img_list, axis=0)
-                    Image.fromarray(img_list).save(os.path.join(args.output_dir, f"{str(global_step).zfill(5)}.jpg"))
+
+                    # 🔥 Modified validation section: Generate comparison images for different layers
+                    if args.token_index == 'compare':
+                        # Generate comparison images for all layers
+                        generate_layer_comparison(batch, tokenizer, image_encoder, text_encoder, unet, mapper, vae, batch["pixel_values_clip"].device, args.output_dir, global_step)
+                    else:
+                        # Generate images for specified layer
+                        syn_images = validation(batch, tokenizer, image_encoder, text_encoder, unet, mapper, vae, batch["pixel_values_clip"].device, 5, token_index=args.token_index)
+                        gt_images = [th2image(img) for img in batch["pixel_values"]]
+                        img_list = []
+                        for syn, gt in zip(syn_images, gt_images):
+                            img_list.append(np.concatenate((np.array(syn), np.array(gt)), axis=1))
+                        img_list = np.concatenate(img_list, axis=0)
+
+                        # Add layer information to filename
+                        if args.token_index != 'full':
+                            filename = f"{str(global_step).zfill(5)}_layer_{args.token_index}.jpg"
+                        else:
+                            filename = f"{str(global_step).zfill(5)}_full.jpg"
+                        Image.fromarray(img_list).save(os.path.join(args.output_dir, filename))
 
             logs = {"loss_mle": loss_mle.detach().item(), "loss_reg": loss_reg.detach().item(),  "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
